@@ -30,7 +30,7 @@ const diskUuidOfUnknownOrigin = "D209C89E-EA5E-4FBD-B161-B461CCE297E0"
 // efiPartition defines the default ESP. See also
 // https://en.wikipedia.org/wiki/EFI_system_partition
 var efiPartition = disk.Partition{
-	Size: 501 * MebiByte,
+	Size: 32 * MebiByte,
 	Type: disk.EFISystemPartitionGUID,
 	UUID: disk.EFISystemPartitionUUID,
 	Payload: &disk.Filesystem{
@@ -49,7 +49,7 @@ var efiPartition = disk.Partition{
 // (which this project doesn't support today...)
 // See also https://github.com/containers/bootc/pull/529/commits/e5548d8765079171e6ed39a3ab0479bc8681a1c9
 var bootPartition = disk.Partition{
-	Size: 1 * GibiByte,
+	Size: 256 * MebiByte,
 	Type: disk.FilesystemDataGUID,
 	UUID: disk.DataPartitionUUID,
 	Payload: &disk.Filesystem{

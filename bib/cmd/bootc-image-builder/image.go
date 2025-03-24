@@ -34,7 +34,7 @@ import (
 )
 
 // TODO: Auto-detect this from container image metadata
-const DEFAULT_SIZE = uint64(10 * GibiByte)
+const DEFAULT_SIZE = uint64(2 * GibiByte)
 
 type ManifestConfig struct {
 	// OCI image path (without the transport, that is always docker://)
