@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ import (
 	"github.com/osbuild/images/pkg/cloud/awscloud"
 	"github.com/osbuild/images/pkg/container"
 	"github.com/osbuild/images/pkg/dnfjson"
+	"github.com/osbuild/images/pkg/experimentalflags"
 	"github.com/osbuild/images/pkg/manifest"
 	"github.com/osbuild/images/pkg/osbuild"
 	"github.com/osbuild/images/pkg/rpmmd"
@@ -29,10 +31,11 @@ import (
 	"github.com/osbuild/bootc-image-builder/bib/internal/buildconfig"
 	podman_container "github.com/osbuild/bootc-image-builder/bib/internal/container"
 	"github.com/osbuild/bootc-image-builder/bib/internal/imagetypes"
-	"github.com/osbuild/bootc-image-builder/bib/internal/setup"
 	"github.com/osbuild/bootc-image-builder/bib/internal/source"
-	"github.com/osbuild/bootc-image-builder/bib/internal/util"
-	"github.com/osbuild/bootc-image-builder/bib/pkg/progress"
+
+	"github.com/osbuild/image-builder-cli/pkg/progress"
+	"github.com/osbuild/image-builder-cli/pkg/setup"
+	"github.com/osbuild/image-builder-cli/pkg/util"
 )
 
 const (
@@ -164,7 +167,7 @@ func makeManifest(c *ManifestConfig, solver *dnfjson.Solver, cacheRoot string) (
 	return mf, depsolvedRepos, nil
 }
 
-func saveManifest(ms manifest.OSBuildManifest, fpath string) error {
+func saveManifest(ms manifest.OSBuildManifest, fpath string) (err error) {
 	b, err := json.MarshalIndent(ms, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal data for %q: %s", fpath, err.Error())
@@ -174,7 +177,7 @@ func saveManifest(ms manifest.OSBuildManifest, fpath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create output file %q: %s", fpath, err.Error())
 	}
-	defer fp.Close()
+	defer func() { err = errors.Join(err, fp.Close()) }()
 	if _, err := fp.Write(b); err != nil {
 		return fmt.Errorf("failed to write output file %q: %s", fpath, err.Error())
 	}
@@ -200,6 +203,7 @@ func manifestFromCobra(cmd *cobra.Command, args []string, pbar progress.Progress
 	rpmCacheRoot, _ := cmd.Flags().GetString("rpmmd")
 	targetArch, _ := cmd.Flags().GetString("target-arch")
 	rootFs, _ := cmd.Flags().GetString("rootfs")
+	buildImgref, _ := cmd.Flags().GetString("build-container")
 	useLibrepo, _ := cmd.Flags().GetBool("use-librepo")
 
 	// If --local was given, warn in the case of --local or --local=true (true is the default), error in the case of --local=false
@@ -213,17 +217,23 @@ func manifestFromCobra(cmd *cobra.Command, args []string, pbar progress.Progress
 		}
 	}
 
-	if targetArch != "" && arch.FromString(targetArch) != arch.Current() {
-		// TODO: detect if binfmt_misc for target arch is
-		// available, e.g. by mounting the binfmt_misc fs into
-		// the container and inspects the files or by
-		// including tiny statically linked target-arch
-		// binaries inside our bib container
-		fmt.Fprintf(os.Stderr, "WARNING: target-arch is experimental and needs an installed 'qemu-user' package\n")
-		if slices.Contains(imgTypes, "iso") {
-			return nil, nil, fmt.Errorf("cannot build iso for different target arches yet")
+	if targetArch != "" {
+		target, err := arch.FromString(targetArch)
+		if err != nil {
+			return nil, nil, err
 		}
-		cntArch = arch.FromString(targetArch)
+		if target != arch.Current() {
+			// TODO: detect if binfmt_misc for target arch is
+			// available, e.g. by mounting the binfmt_misc fs into
+			// the container and inspects the files or by
+			// including tiny statically linked target-arch
+			// binaries inside our bib container
+			fmt.Fprintf(os.Stderr, "WARNING: target-arch is experimental and needs an installed 'qemu-user' package\n")
+			if slices.Contains(imgTypes, "iso") {
+				return nil, nil, fmt.Errorf("cannot build iso for different target arches yet")
+			}
+			cntArch = target
+		}
 	}
 	// TODO: add "target-variant", see https://github.com/osbuild/bootc-image-builder/pull/139/files#r1467591868
 
@@ -275,18 +285,6 @@ func manifestFromCobra(cmd *cobra.Command, args []string, pbar progress.Progress
 				return nil, nil, fmt.Errorf(`no default root filesystem type specified in container, please use "--rootfs" to set manually`)
 			}
 		}
-
-		// TODO: on a cross arch build we need to be conservative, i.e. we can
-		// only use the default ext4 because if xfs is select we run into the
-		// issue that mkfs.xfs calls "ioctl(BLKBSZSET)" which is missing in
-		// qemu-user.
-		// The fix has been merged upstream https://www.mail-archive.com/qemu-devel@nongnu.org/msg1037409.html
-		// and is expected to be included in v9.1.0 https://github.com/qemu/qemu/commit/e6e903db6a5e960e595f9f1fd034adb942dd9508
-		// Remove the following condition once we update to qemu-user v9.1.0.
-		if cntArch != arch.Current() && rootfsType != "ext4" {
-			logrus.Warningf("container preferred root filesystem %q cannot be used during cross arch build", rootfsType)
-			rootfsType = "ext4"
-		}
 	}
 	// Gather some data from the containers distro
 	sourceinfo, err := source.LoadInfo(container.Root())
@@ -294,26 +292,55 @@ func manifestFromCobra(cmd *cobra.Command, args []string, pbar progress.Progress
 		return nil, nil, err
 	}
 
+	buildContainer := container
+	buildSourceinfo := sourceinfo
+	startedBuildContainer := false
+	defer func() {
+		if startedBuildContainer {
+			if err := buildContainer.Stop(); err != nil {
+				logrus.Warnf("error stopping container: %v", err)
+			}
+		}
+	}()
+
+	if buildImgref != "" {
+		buildContainer, err = podman_container.New(buildImgref)
+		if err != nil {
+			return nil, nil, err
+		}
+		startedBuildContainer = true
+
+		// Gather some data from the containers distro
+		buildSourceinfo, err = source.LoadInfo(buildContainer.Root())
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		buildImgref = imgref
+	}
+
 	// This is needed just for RHEL and RHSM in most cases, but let's run it every time in case
 	// the image has some non-standard dnf plugins.
-	if err := container.InitDNF(); err != nil {
+	if err := buildContainer.InitDNF(); err != nil {
 		return nil, nil, err
 	}
-	solver, err := container.NewContainerSolver(rpmCacheRoot, cntArch, sourceinfo)
+	solver, err := buildContainer.NewContainerSolver(rpmCacheRoot, cntArch, sourceinfo)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	manifestConfig := &ManifestConfig{
-		Architecture:   cntArch,
-		Config:         config,
-		ImageTypes:     imageTypes,
-		Imgref:         imgref,
-		RootfsMinsize:  cntSize * containerSizeToDiskSizeMultiplier,
-		DistroDefPaths: distroDefPaths,
-		SourceInfo:     sourceinfo,
-		RootFSType:     rootfsType,
-		UseLibrepo:     useLibrepo,
+		Architecture:    cntArch,
+		Config:          config,
+		ImageTypes:      imageTypes,
+		Imgref:          imgref,
+		BuildImgref:     buildImgref,
+		RootfsMinsize:   cntSize * containerSizeToDiskSizeMultiplier,
+		DistroDefPaths:  distroDefPaths,
+		SourceInfo:      sourceinfo,
+		BuildSourceInfo: buildSourceinfo,
+		RootFSType:      rootfsType,
+		UseLibrepo:      useLibrepo,
 	}
 
 	manifest, repos, err := makeManifest(manifestConfig, solver, rpmCacheRoot)
@@ -461,6 +488,9 @@ func cmdBuild(cmd *cobra.Command, args []string) error {
 		osbuildEnv = append(osbuildEnv, envVars...)
 	}
 
+	if experimentalflags.Bool("debug-qemu-user") {
+		osbuildEnv = append(osbuildEnv, "OBSBUILD_EXPERIMENAL=debug-qemu-user")
+	}
 	osbuildOpts := progress.OSBuildOptions{
 		StoreDir:  osbuildStore,
 		OutputDir: outputDir,
@@ -650,13 +680,14 @@ func buildCobraCmdline() (*cobra.Command, error) {
 	}
 	manifestCmd.Flags().String("rpmmd", "/rpmmd", "rpm metadata cache directory")
 	manifestCmd.Flags().String("target-arch", "", "build for the given target architecture (experimental)")
+	manifestCmd.Flags().String("build-container", "", "Use a custom container for the image build")
 	manifestCmd.Flags().StringArray("type", []string{"qcow2"}, fmt.Sprintf("image types to build [%s]", imagetypes.Available()))
 	manifestCmd.Flags().Bool("local", true, "DEPRECATED: --local is now the default behavior, make sure to pull the container image before running bootc-image-builder")
 	if err := manifestCmd.Flags().MarkHidden("local"); err != nil {
 		return nil, fmt.Errorf("cannot hide 'local' :%w", err)
 	}
 	manifestCmd.Flags().String("rootfs", "", "Root filesystem type. If not given, the default configured in the source container image is used.")
-	manifestCmd.Flags().Bool("use-librepo", false, "(experimenal) switch to librepo for pkg download, needs new enough osbuild")
+	manifestCmd.Flags().Bool("use-librepo", true, "switch to librepo for pkg download, needs new enough osbuild")
 	// --config is only useful for developers who run bib outside
 	// of a container to generate a manifest. so hide it by
 	// default from users.

@@ -9,7 +9,7 @@ import textwrap
 import pytest
 
 import testutil
-from containerbuild import build_container_fixture  # pylint: disable=unused-import
+from containerbuild import build_container_fixture as _
 from containerbuild import make_container
 from testcases import gen_testcases
 
@@ -304,7 +304,7 @@ def test_mount_ostree_error(tmpdir_factory, build_container):
             "manifest", f"{container_ref}",
             "--config", "/output/config.json",
         ], stderr=subprocess.PIPE, encoding="utf8")
-    assert 'The following errors occurred while validating custom mountpoints:\npath "/ostree" is not allowed' \
+    assert 'the following errors occurred while validating custom mountpoints:\npath "/ostree" is not allowed' \
         in exc.value.stderr
 
 
@@ -405,15 +405,36 @@ def test_manifest_anaconda_module_customizations(tmpdir_factory, build_container
     assert "org.fedoraproject.Anaconda.Modules.Timezone" not in st["options"]["activatable-modules"]
 
 
-def find_fstab_stage_from(manifest_str):
+def find_fs_mount_info_from(manifest_str):
     manifest = json.loads(manifest_str)
+    mount_stages = []
+    # normally there should be only one swap partition, but there's no technical reason you can't have multiple
+    swap_stages = []
     for pipeline in manifest["pipelines"]:
-        # the fstab stage in cross-arch manifests is in the "ostree-deployment" pipeline
+        # the mount unit stages in cross-arch manifests are in the "ostree-deployment" pipeline
         if pipeline["name"] in ("image", "ostree-deployment"):
             for st in pipeline["stages"]:
-                if st["type"] == "org.osbuild.fstab":
-                    return st
-    raise ValueError(f"cannot find fstab stage in manifest:\n{manifest_str}")
+                if st["type"] == "org.osbuild.systemd.unit.create":
+                    options = st["options"]
+                    if options["filename"].endswith(".mount"):
+                        mount_stages.append(st)
+                    elif options["filename"].endswith(".swap"):
+                        swap_stages.append(st)
+
+    if not mount_stages:
+        raise ValueError(f"cannot find mount unit creation stages in manifest:\n{manifest_str}")
+
+    mounts = []
+    for stage in mount_stages:
+        options = stage["options"]["config"]
+        mounts.append(options["Mount"])
+
+    swaps = []
+    for stage in swap_stages:
+        options = stage["options"]["config"]
+        swaps.append(options["Swap"])
+
+    return mounts, swaps
 
 
 @pytest.mark.parametrize("fscustomizations,rootfs", [
@@ -480,25 +501,23 @@ def test_manifest_fs_customizations_smoke_toml(tmp_path, build_container):
 
 
 def assert_fs_customizations(customizations, fstype, manifest):
-    # use the fstab stage to get filesystem types for each mountpoint
-    fstab_stage = find_fstab_stage_from(manifest)
-    filesystems = fstab_stage["options"]["filesystems"]
+    mounts, _ = find_fs_mount_info_from(manifest)
 
     manifest_mountpoints = set()
-    for fs in filesystems:
-        manifest_mountpoints.add(fs["path"])
-        if fs["path"] == "/boot/efi":
-            assert fs["vfs_type"] == "vfat"
+    for mount in mounts:
+        manifest_mountpoints.add(mount["Where"])
+        if mount["Where"] == "/boot/efi":
+            assert mount["Type"] == "vfat"
             continue
 
-        if fstype == "btrfs" and fs["path"] == "/boot":
+        if fstype == "btrfs" and mount["Where"] == "/boot":
             # /boot keeps its default fstype when using btrfs
-            assert fs["vfs_type"] == "ext4"
+            assert mount["Type"] == "ext4"
             continue
 
-        assert fs["vfs_type"] == fstype, f"incorrect filesystem type for {fs['path']}"
+        assert mount["Type"] == fstype, f"incorrect filesystem type for {mount['Where']}"
 
-    # check that all fs customizations appear in fstab
+    # check that all fs customizations appear in the manifest
     for custom_mountpoint in customizations:
         assert custom_mountpoint in manifest_mountpoints
 
@@ -537,8 +556,7 @@ def test_manifest_fs_customizations_xarch(tmp_path, build_container, fscustomiza
         "manifest", f"{container_ref}",
     ])
 
-    # cross-arch builds only support ext4 (for now)
-    assert_fs_customizations(fscustomizations, "ext4", output)
+    assert_fs_customizations(fscustomizations, rootfs, output)
 
 
 def find_grub2_iso_stage_from(manifest_str):
@@ -589,33 +607,23 @@ def test_manifest_disk_customization_lvm(tmp_path, build_container):
     container_ref = "quay.io/centos-bootc/centos-bootc:stream9"
     testutil.pull_container(container_ref)
 
-    config = {
-        "customizations": {
-            "disk": {
-                "partitions": [
-                    {
-                        "type": "lvm",
-                        "minsize": "10 GiB",
-                        "logical_volumes": [
-                            {
-                                "minsize": "10 GiB",
-                                "fs_type": "ext4",
-                                "mountpoint": "/",
-                            }
-                        ]
-                    }
-                ]
-            }
-        }
-    }
-    config_path = tmp_path / "config.json"
-    with config_path.open("w") as config_file:
-        json.dump(config, config_file)
+    config = textwrap.dedent("""\
+    [[customizations.disk.partitions]]
+    type = "lvm"
+    minsize = "10 GiB"
+
+    [[customizations.disk.partitions.logical_volumes]]
+    minsize = "10 GiB"
+    fs_type = "ext4"
+    mountpoint = "/"
+    """)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(config)
 
     testutil.pull_container(container_ref)
     output = subprocess.check_output([
         *testutil.podman_run_common,
-        "-v", f"{config_path}:/config.json:ro",
+        "-v", f"{config_path}:/config.toml:ro",
         build_container,
         "manifest", f"{container_ref}",
     ])
@@ -699,14 +707,12 @@ def test_manifest_disk_customization_swap(tmp_path, build_container):
     mkswap_stage = find_mkswap_stage_from(output)
     assert mkswap_stage["options"].get("uuid")
     swap_uuid = mkswap_stage["options"]["uuid"]
-    fstab_stage = find_fstab_stage_from(output)
-    filesystems = fstab_stage["options"]["filesystems"]
+    _, swaps = find_fs_mount_info_from(output)
+    what_node = f"/dev/disk/by-uuid/{swap_uuid}"
     assert {
-        'uuid': swap_uuid,
-        "vfs_type": "swap",
-        "path": "none",
-        "options": "defaults",
-    } in filesystems
+        "What": what_node,
+        "Options": "defaults",
+    } in swaps
 
 
 def test_manifest_disk_customization_lvm_swap(tmp_path, build_container):
@@ -744,14 +750,12 @@ def test_manifest_disk_customization_lvm_swap(tmp_path, build_container):
     mkswap_stage = find_mkswap_stage_from(output)
     assert mkswap_stage["options"].get("uuid")
     swap_uuid = mkswap_stage["options"]["uuid"]
-    fstab_stage = find_fstab_stage_from(output)
-    filesystems = fstab_stage["options"]["filesystems"]
+    _, swaps = find_fs_mount_info_from(output)
+    what_node = f"/dev/disk/by-uuid/{swap_uuid}"
     assert {
-        'uuid': swap_uuid,
-        "vfs_type": "swap",
-        "path": "none",
-        "options": "defaults",
-    } in filesystems
+        "What": what_node,
+        "Options": "defaults",
+    } in swaps
     # run osbuild schema validation, see gh#748
     if not testutil.has_executable("osbuild"):
         pytest.skip("no osbuild executable")
@@ -822,3 +826,101 @@ def test_manifest_customization_custom_file_smoke(tmp_path, build_container):
             '[{"path":"/etc/custom_dir","exist_ok":true}]},'
             '"devices":{"disk":{"type":"org.osbuild.loopback"'
             ',"options":{"filename":"disk.raw"') in output
+
+
+def find_sfdisk_stage_from(manifest_str):
+    manifest = json.loads(manifest_str)
+    for pipl in manifest["pipelines"]:
+        if pipl["name"] == "image":
+            for st in pipl["stages"]:
+                if st["type"] == "org.osbuild.sfdisk":
+                    return st["options"]
+    raise ValueError(f"cannot find sfdisk stage manifest:\n{manifest_str}")
+
+
+def test_manifest_image_customize_filesystem(tmp_path, build_container):
+    # no need to parameterize this test, overrides behaves same for all containers
+    container_ref = "quay.io/centos-bootc/centos-bootc:stream9"
+    testutil.pull_container(container_ref)
+
+    cfg = {
+        "blueprint": {
+            "customizations": {
+                "filesystem": [
+                    {
+                        "mountpoint": "/boot",
+                        "minsize": "3GiB"
+                    }
+                ]
+            },
+        },
+    }
+
+    config_json_path = tmp_path / "config.json"
+    config_json_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    # create derrived container with filesystem customization
+    cntf_path = tmp_path / "Containerfile"
+    cntf_path.write_text(textwrap.dedent(f"""\n
+    FROM {container_ref}
+    RUN mkdir -p -m 0755 /usr/lib/bootc-image-builder
+    COPY config.json /usr/lib/bootc-image-builder/
+    """), encoding="utf8")
+
+    print(f"building filesystem customize container from {container_ref}")
+    with make_container(tmp_path) as container_tag:
+        print(f"using {container_tag}")
+        manifest_str = subprocess.check_output([
+            *testutil.podman_run_common,
+            build_container,
+            "manifest",
+            f"localhost/{container_tag}",
+        ], encoding="utf8")
+        sfdisk_options = find_sfdisk_stage_from(manifest_str)
+        assert sfdisk_options["partitions"][2]["size"] == 3 * 1024 * 1024 * 1024 / 512
+
+
+def test_manifest_image_customize_disk(tmp_path, build_container):
+    # no need to parameterize this test, overrides behaves same for all containers
+    container_ref = "quay.io/centos-bootc/centos-bootc:stream9"
+    testutil.pull_container(container_ref)
+
+    cfg = {
+        "blueprint": {
+            "customizations": {
+                "disk": {
+                    "partitions": [
+                        {
+                            "label": "var",
+                            "mountpoint": "/var",
+                            "fs_type": "ext4",
+                            "minsize": "3 GiB",
+                        },
+                    ],
+                },
+            },
+        },
+    }
+
+    config_json_path = tmp_path / "config.json"
+    config_json_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    # create derrived container with disk customization
+    cntf_path = tmp_path / "Containerfile"
+    cntf_path.write_text(textwrap.dedent(f"""\n
+    FROM {container_ref}
+    RUN mkdir -p -m 0755 /usr/lib/bootc-image-builder
+    COPY config.json /usr/lib/bootc-image-builder/
+    """), encoding="utf8")
+
+    print(f"building filesystem customize container from {container_ref}")
+    with make_container(tmp_path) as container_tag:
+        print(f"using {container_tag}")
+        manifest_str = subprocess.check_output([
+            *testutil.podman_run_common,
+            build_container,
+            "manifest",
+            f"localhost/{container_tag}",
+        ], encoding="utf8")
+        sfdisk_options = find_sfdisk_stage_from(manifest_str)
+        assert sfdisk_options["partitions"][2]["size"] == 3 * 1024 * 1024 * 1024 / 512
