@@ -14,6 +14,8 @@ CLOUD_BOOT_IMAGE_TYPES = ["ami"]
 class TestCase:
     # container_ref to the bootc image, e.g. quay.io/fedora/fedora-bootc:40
     container_ref: str = ""
+    # optional build_container_ref to the bootc image, e.g. quay.io/fedora/fedora-bootc:40
+    build_container_ref: str = ""
     # image is the image type, e.g. "ami"
     image: str = ""
     # target_arch is the target archicture, empty means current arch
@@ -115,9 +117,7 @@ def gen_testcases(what):  # pylint: disable=too-many-return-statements
             TestCaseFedora(image="qcow2"),
             # test with custom disk configs
             TestCaseC9S(image="qcow2", disk_config="swap"),
-            # mvo: disabled 2025-05-21 because:
-            # "ERROR Installing to filesystem: Creating ostree deployment: invalid reference format"
-            # TestCaseFedora43(image="raw", disk_config="btrfs"),
+            TestCaseFedora43(image="raw", disk_config="btrfs"),
             TestCaseC9S(image="raw", disk_config="lvm"),
         ]
     if what == "all":
@@ -140,5 +140,9 @@ def gen_testcases(what):  # pylint: disable=too-many-return-statements
             TestCaseC9S(target_arch="arm64"),
             TestCaseFedora(target_arch="ppc64le"),
             TestCaseFedora(target_arch="s390x"),
+        ]
+    if what == "build-container":
+        return [
+            TestCaseC9S(build_container_ref="quay.io/centos-bootc/centos-bootc:stream10", image="qcow2"),
         ]
     raise ValueError(f"unknown test-case type {what}")

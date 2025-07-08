@@ -2,8 +2,10 @@ import json
 import os
 import pathlib
 import platform
+import random
 import re
 import shutil
+import string
 import subprocess
 import tempfile
 import uuid
@@ -35,6 +37,7 @@ class ImageBuildResult(NamedTuple):
     img_path: str
     img_arch: str
     container_ref: str
+    build_container_ref: str
     rootfs: str
     disk_config: str
     username: str
@@ -255,7 +258,9 @@ def build_images(shared_tmpdir, build_container, request, force_aws_upload, gpg_
     image_types = request.param.image.split("+")
 
     username = "test"
-    password = "password"
+    # use 18 char random password
+    password = "".join(
+        random.choices(string.ascii_uppercase + string.digits, k=18))
     kargs = "systemd.journald.forward_to_console=1"
 
     container_ref = tc.container_ref
@@ -314,7 +319,7 @@ def build_images(shared_tmpdir, build_container, request, force_aws_upload, gpg_
             bib_output = bib_output_path.read_text(encoding="utf8")
             results.append(ImageBuildResult(
                 image_type, generated_img, tc.target_arch,
-                container_ref, tc.rootfs, tc.disk_config,
+                container_ref, tc.build_container_ref, tc.rootfs, tc.disk_config,
                 username, password,
                 ssh_keyfile_private_path, kargs, bib_output, journal_output))
 
@@ -374,16 +379,20 @@ def build_images(shared_tmpdir, build_container, request, force_aws_upload, gpg_
     }
     testutil.maybe_create_filesystem_customizations(cfg, tc)
     testutil.maybe_create_disk_customizations(cfg, tc)
-    print(f"config for {output_path} {tc=}: {cfg=}")
 
     config_json_path = output_path / "config.json"
     config_json_path.write_text(json.dumps(cfg), encoding="utf-8")
+    # mask pw
+    for user in cfg["customizations"]["user"]:
+        user["password"] = "***"
+    print(f"config for {output_path} {tc=}: {cfg=}")
 
     cursor = testutil.journal_cursor()
 
     upload_args = []
     creds_args = []
     target_arch_args = []
+    build_container_args = []
     if tc.target_arch:
         target_arch_args = ["--target-arch", tc.target_arch]
 
@@ -433,10 +442,16 @@ def build_images(shared_tmpdir, build_container, request, force_aws_upload, gpg_
             # Pull the signed image
             testutil.pull_container(container_ref, tls_verify=False)
 
+        if tc.build_container_ref:
+            build_container_args = [
+                "--build-container", tc.build_container_ref,
+            ]
+
         cmd.extend([
             *creds_args,
             build_container,
             container_ref,
+            *build_container_args,
             *types_arg,
             *upload_args,
             *target_arch_args,
@@ -476,7 +491,7 @@ def build_images(shared_tmpdir, build_container, request, force_aws_upload, gpg_
     for image_type in image_types:
         results.append(ImageBuildResult(
             image_type, artifact[image_type], tc.target_arch,
-            container_ref, tc.rootfs, tc.disk_config,
+            container_ref, tc.build_container_ref, tc.rootfs, tc.disk_config,
             username, password,
             ssh_keyfile_private_path, kargs, bib_output, journal_output, metadata))
     yield results
@@ -506,6 +521,12 @@ def test_container_builds(build_container):
 
 @pytest.mark.parametrize("image_type", gen_testcases("multidisk"), indirect=["image_type"])
 def test_image_is_generated(image_type):
+    assert image_type.img_path.exists(), "output file missing, dir "\
+        f"content: {os.listdir(os.fspath(image_type.img_path))}"
+
+
+@pytest.mark.parametrize("image_type", gen_testcases("build-container"), indirect=["image_type"])
+def test_build_container_works(image_type):
     assert image_type.img_path.exists(), "output file missing, dir "\
         f"content: {os.listdir(os.fspath(image_type.img_path))}"
 
